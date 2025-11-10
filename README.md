@@ -4,7 +4,6 @@ LoRA Fine-Tuning with Knowledge Graph–Enhanced Training
 This repository contains the code, dataset samples, and report for the project:
 
 “A Byte-Level Seq2Seq Language Model for Indian Mythology: LoRA Fine-Tuning with Knowledge Graph–Enhanced Training”
-Developed as part of MAT499: Project Phase I at SASTRA Deemed to be University (2025)
 by Chakravadhanula Naga Pranav
 
 🧠 Project Overview
