@@ -1,0 +1,288 @@
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": []
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "KLznqDU_Kqgf"
+      },
+      "outputs": [],
+      "source": [
+        "import pandas as pd\n",
+        "import torch\n",
+        "from torch.utils.data import Dataset\n",
+        "from transformers import (\n",
+        "    AutoTokenizer,\n",
+        "    AutoModelForSeq2SeqLM,\n",
+        "    Trainer,\n",
+        "    TrainingArguments,\n",
+        "    DataCollatorForSeq2Seq,\n",
+        "    EarlyStoppingCallback,\n",
+        "    TrainerCallback\n",
+        ")\n",
+        "from peft import LoraConfig, get_peft_model\n",
+        "import evaluate\n",
+        "import numpy as np\n",
+        "import os\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# Load Dataset (question, context, answer)\n",
+        "path = \"/content/byt5_training_data_Final.csv\"\n",
+        "df = pd.read_csv(path)\n",
+        "df.columns = [c.lower().strip() for c in df.columns]\n",
+        "print(\"📄 Columns in CSV:\", df.columns.tolist())\n",
+        "\n",
+        "q_col, c_col, a_col = \"question\", \"context\", \"answer\"\n",
+        "df = df.dropna(subset=[q_col, c_col, a_col])\n",
+        "print(f\"✅ Loaded {len(df)} samples with columns: {q_col}, {c_col}, {a_col}\")\n",
+        "\n",
+        "# Split into train/validation\n",
+        "train_df = df.sample(frac=0.9, random_state=42)\n",
+        "val_df = df.drop(train_df.index)"
+      ],
+      "metadata": {
+        "id": "63n68Gj-LasZ"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# Tokenizer and Base Model\n",
+        "model_name = \"google/byt5-small\"\n",
+        "tokenizer = AutoTokenizer.from_pretrained(model_name)\n",
+        "base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)"
+      ],
+      "metadata": {
+        "id": "9982dnhoLh9p"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# LoRA\n",
+        "from peft import LoraConfig, get_peft_model\n",
+        "\n",
+        "lora_config = LoraConfig(\n",
+        "    r=16,\n",
+        "    lora_alpha=32,\n",
+        "    target_modules=[\"q\", \"v\"],\n",
+        "    lora_dropout=0.05,\n",
+        "    bias=\"none\",\n",
+        "    task_type=\"SEQ_2_SEQ_LM\",\n",
+        ")\n",
+        "\n",
+        "model = get_peft_model(base_model, lora_config)\n",
+        "model.print_trainable_parameters()"
+      ],
+      "metadata": {
+        "id": "wrAOmtM_LiAD"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# Dataset Class (question + context → answer)\n",
+        "class QADataset(Dataset):\n",
+        "    def __init__(self, df, tokenizer, q_col, c_col, a_col, max_len=512):\n",
+        "        self.df = df\n",
+        "        self.tokenizer = tokenizer\n",
+        "        self.q_col, self.c_col, self.a_col = q_col, c_col, a_col\n",
+        "        self.max_len = max_len\n",
+        "\n",
+        "    def __len__(self):\n",
+        "        return len(self.df)\n",
+        "\n",
+        "    def __getitem__(self, idx):\n",
+        "        row = self.df.iloc[idx]\n",
+        "        source = f\"question: {row[self.q_col]} context: {row[self.c_col]}\"\n",
+        "        target = str(row[self.a_col])\n",
+        "\n",
+        "        model_inputs = self.tokenizer(\n",
+        "            source,\n",
+        "            max_length=self.max_len,\n",
+        "            truncation=True,\n",
+        "            padding=\"max_length\",\n",
+        "            return_tensors=\"pt\"\n",
+        "        )\n",
+        "        labels = self.tokenizer(\n",
+        "            target,\n",
+        "            max_length=128,\n",
+        "            truncation=True,\n",
+        "            padding=\"max_length\",\n",
+        "            return_tensors=\"pt\"\n",
+        "        )\n",
+        "\n",
+        "        model_inputs[\"labels\"] = labels[\"input_ids\"]\n",
+        "        return {k: v.squeeze() for k, v in model_inputs.items()}\n",
+        "\n",
+        "train_dataset = QADataset(train_df, tokenizer, q_col, c_col, a_col)\n",
+        "val_dataset = QADataset(val_df, tokenizer, q_col, c_col, a_col)"
+      ],
+      "metadata": {
+        "id": "OyDPwVM7LiDa"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# ====================================================\n",
+        "# ✨ CALLBACK TO ENSURE CONTIGUOUS PARAMS ✨\n",
+        "# ====================================================\n",
+        "class ContiguousCallback(TrainerCallback):\n",
+        "    def on_save(self, args, state, control, **kwargs):\n",
+        "        for param in kwargs['model'].parameters():\n",
+        "            if not param.is_contiguous():\n",
+        "                param.data = param.contiguous()"
+      ],
+      "metadata": {
+        "id": "bYTIMOwaL3-Q"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# ====================================================\n",
+        "# 5️⃣ Training Arguments\n",
+        "# ====================================================\n",
+        "output_dir = \"/content/byt5_lora_finetuned\"\n",
+        "\n",
+        "training_args = TrainingArguments(\n",
+        "    output_dir=output_dir,\n",
+        "    evaluation_strategy=\"epoch\",\n",
+        "    save_strategy=\"epoch\",\n",
+        "    learning_rate=2e-4,  # slightly higher for LoRA\n",
+        "    num_train_epochs=5,\n",
+        "    per_device_train_batch_size=4,\n",
+        "    per_device_eval_batch_size=4,\n",
+        "    weight_decay=0.01,\n",
+        "    warmup_ratio=0.1,\n",
+        "    logging_dir=\"./logs\",\n",
+        "    logging_strategy=\"epoch\",\n",
+        "    load_best_model_at_end=True,\n",
+        "    metric_for_best_model=\"eval_loss\",\n",
+        "    save_total_limit=2,\n",
+        "    fp16=True,\n",
+        "    gradient_checkpointing=False,\n",
+        "    save_safetensors=False,\n",
+        "    report_to=\"none\",\n",
+        ")\n",
+        "\n",
+        "data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)\n",
+        "\n",
+        "trainer = Trainer(\n",
+        "    model=model,\n",
+        "    args=training_args,\n",
+        "    train_dataset=train_dataset,\n",
+        "    eval_dataset=val_dataset,\n",
+        "    data_collator=data_collator,\n",
+        "    tokenizer=tokenizer,\n",
+        "    compute_metrics=None,\n",
+        "    callbacks=[\n",
+        "        EarlyStoppingCallback(early_stopping_patience=2),\n",
+        "        ContiguousCallback()\n",
+        "    ],\n",
+        ")\n",
+        "\n",
+        "train_result = trainer.train()"
+      ],
+      "metadata": {
+        "id": "PEH1YOc1L8cn"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# Evaluate Model\n",
+        "rouge = evaluate.load(\"rouge\")\n",
+        "bleu = evaluate.load(\"bleu\")\n",
+        "\n",
+        "predictions, references = [], []\n",
+        "\n",
+        "model.eval()\n",
+        "for i in range(0, len(val_dataset), 4):\n",
+        "    batch = [val_dataset[j] for j in range(i, min(i + 4, len(val_dataset)))]\n",
+        "    input_ids = torch.stack([b[\"input_ids\"] for b in batch]).to(model.device)\n",
+        "    attention_mask = torch.stack([b[\"attention_mask\"] for b in batch]).to(model.device)\n",
+        "    ref_indices = [val_df.index[i + j] for j in range(len(batch))]\n",
+        "    labels = [df.loc[idx][a_col] for idx in ref_indices]\n",
+        "\n",
+        "    with torch.no_grad():\n",
+        "        outputs = model.generate(\n",
+        "            input_ids=input_ids,\n",
+        "            attention_mask=attention_mask,\n",
+        "            max_new_tokens=100,\n",
+        "            num_beams=4\n",
+        "        )\n",
+        "\n",
+        "    decoded_preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)\n",
+        "    predictions.extend(decoded_preds)\n",
+        "    references.extend(labels)\n",
+        "\n",
+        "rouge_result = rouge.compute(predictions=predictions, references=references)\n",
+        "bleu_result = bleu.compute(predictions=predictions, references=[[r] for r in references])\n",
+        "\n",
+        "final_metrics = {\n",
+        "    \"rouge1\": rouge_result[\"rouge1\"],\n",
+        "    \"rougel\": rouge_result[\"rougeL\"],\n",
+        "    \"bleu\": bleu_result[\"bleu\"],\n",
+        "}\n",
+        "\n",
+        "print(\"\\n📊 Final Evaluation Metrics:\")\n",
+        "for k, v in final_metrics.items():\n",
+        "    print(f\"{k}: {v:.4f}\")\n",
+        "\n",
+        "pd.DataFrame([final_metrics]).to_csv(\"final_evaluation_metrics_lora.csv\", index=False)\n",
+        "print(\"✅ Metrics saved to final_evaluation_metrics_lora.csv\")"
+      ],
+      "metadata": {
+        "id": "UQlMmQ5dMC8t"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# Save Model (LoRA Adapter)\n",
+        "merged_model = model.merge_and_unload()\n",
+        "merged_model.save_pretrained(\"/content/byt5_full_merged\")\n",
+        "tokenizer.save_pretrained(\"/content/byt5_full_merged\")\n",
+        "print(\"✅ Merged model saved to /content/byt5_full_merged\")"
+      ],
+      "metadata": {
+        "id": "q9-lI4trMRVV"
+      },
+      "execution_count": null,
+      "outputs": []
+    }
+  ]
+}
