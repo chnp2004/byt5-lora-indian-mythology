@@ -1,0 +1,181 @@
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    Trainer,
+    TrainingArguments,
+    DataCollatorForSeq2Seq,
+    EarlyStoppingCallback,
+    TrainerCallback
+)
+from peft import LoraConfig, get_peft_model
+import evaluate
+import numpy as np
+import os
+
+# Load Dataset (question, context, answer)
+path = "/content/byt5_training_data_Final.csv"
+df = pd.read_csv(path)
+df.columns = [c.lower().strip() for c in df.columns]
+print("📄 Columns in CSV:", df.columns.tolist())
+
+q_col, c_col, a_col = "question", "context", "answer"
+df = df.dropna(subset=[q_col, c_col, a_col])
+print(f"✅ Loaded {len(df)} samples with columns: {q_col}, {c_col}, {a_col}")
+
+# Split into train/validation
+train_df = df.sample(frac=0.9, random_state=42)
+val_df = df.drop(train_df.index)
+# Tokenizer and Base Model
+model_name = "google/byt5-small"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+# LoRA
+from peft import LoraConfig, get_peft_model
+
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q", "v"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="SEQ_2_SEQ_LM",
+)
+
+model = get_peft_model(base_model, lora_config)
+model.print_trainable_parameters()
+# Dataset Class (question + context → answer)
+class QADataset(Dataset):
+    def __init__(self, df, tokenizer, q_col, c_col, a_col, max_len=512):
+        self.df = df
+        self.tokenizer = tokenizer
+        self.q_col, self.c_col, self.a_col = q_col, c_col, a_col
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        source = f"question: {row[self.q_col]} context: {row[self.c_col]}"
+        target = str(row[self.a_col])
+
+        model_inputs = self.tokenizer(
+            source,
+            max_length=self.max_len,
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt"
+        )
+        labels = self.tokenizer(
+            target,
+            max_length=128,
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt"
+        )
+
+        model_inputs["labels"] = labels["input_ids"]
+        return {k: v.squeeze() for k, v in model_inputs.items()}
+
+train_dataset = QADataset(train_df, tokenizer, q_col, c_col, a_col)
+val_dataset = QADataset(val_df, tokenizer, q_col, c_col, a_col)
+# ====================================================
+# ✨ CALLBACK TO ENSURE CONTIGUOUS PARAMS ✨
+# ====================================================
+class ContiguousCallback(TrainerCallback):
+    def on_save(self, args, state, control, **kwargs):
+        for param in kwargs['model'].parameters():
+            if not param.is_contiguous():
+                param.data = param.contiguous()
+# ====================================================
+# 5️⃣ Training Arguments
+# ====================================================
+output_dir = "/content/byt5_lora_finetuned"
+
+training_args = TrainingArguments(
+    output_dir=output_dir,
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    learning_rate=2e-4,  # slightly higher for LoRA
+    num_train_epochs=5,
+    per_device_train_batch_size=4,
+    per_device_eval_batch_size=4,
+    weight_decay=0.01,
+    warmup_ratio=0.1,
+    logging_dir="./logs",
+    logging_strategy="epoch",
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
+    save_total_limit=2,
+    fp16=True,
+    gradient_checkpointing=False,
+    save_safetensors=False,
+    report_to="none",
+)
+
+data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    data_collator=data_collator,
+    tokenizer=tokenizer,
+    compute_metrics=None,
+    callbacks=[
+        EarlyStoppingCallback(early_stopping_patience=2),
+        ContiguousCallback()
+    ],
+)
+
+train_result = trainer.train()
+# Evaluate Model
+rouge = evaluate.load("rouge")
+bleu = evaluate.load("bleu")
+
+predictions, references = [], []
+
+model.eval()
+for i in range(0, len(val_dataset), 4):
+    batch = [val_dataset[j] for j in range(i, min(i + 4, len(val_dataset)))]
+    input_ids = torch.stack([b["input_ids"] for b in batch]).to(model.device)
+    attention_mask = torch.stack([b["attention_mask"] for b in batch]).to(model.device)
+    ref_indices = [val_df.index[i + j] for j in range(len(batch))]
+    labels = [df.loc[idx][a_col] for idx in ref_indices]
+
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=100,
+            num_beams=4
+        )
+
+    decoded_preds = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+    predictions.extend(decoded_preds)
+    references.extend(labels)
+
+rouge_result = rouge.compute(predictions=predictions, references=references)
+bleu_result = bleu.compute(predictions=predictions, references=[[r] for r in references])
+
+final_metrics = {
+    "rouge1": rouge_result["rouge1"],
+    "rougel": rouge_result["rougeL"],
+    "bleu": bleu_result["bleu"],
+}
+
+print("\n📊 Final Evaluation Metrics:")
+for k, v in final_metrics.items():
+    print(f"{k}: {v:.4f}")
+
+pd.DataFrame([final_metrics]).to_csv("final_evaluation_metrics_lora.csv", index=False)
+print("✅ Metrics saved to final_evaluation_metrics_lora.csv")
+# Save Model (LoRA Adapter)
+merged_model = model.merge_and_unload()
+merged_model.save_pretrained("/content/byt5_full_merged")
+tokenizer.save_pretrained("/content/byt5_full_merged")
+print("✅ Merged model saved to /content/byt5_full_merged")
