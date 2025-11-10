@@ -67,7 +67,7 @@ M.Sc. Data Science, SASTRA Deemed to be University
 
 🪶 License
 
-This project is released under the MIT License.
+This project is released under the Apache 2.0 License.
 Feel free to use, modify, and cite this work with attribution.
 
 💡 Made With
